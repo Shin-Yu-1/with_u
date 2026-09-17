@@ -19,7 +19,7 @@ import { randomUUID } from "node:crypto";
 import * as readline from "node:readline";
 
 const ROOT = join(process.env.HOME ?? "~", ".agent-sessions");
-const MAX_HOPS = 4; // agent→agent auto-forward limit per user message
+const MAX_HOPS = 8; // agent→agent auto-forward limit per user message (pm→planner→pm→dev→pm→reviewer→pm fits)
 
 type Kind = "claude" | "codex";
 interface AgentState { kind: Kind; model?: string; effort?: string; role?: string; native?: string; lastSeq: number }
@@ -49,12 +49,13 @@ const append = (sid: string, e: Omit<Entry, "seq" | "ts">): Entry => {
 
 // ---------- prompts ----------
 const systemPrompt = (s: Session, name: string) => {
-  const others = Object.keys(s.agents).filter((a) => a !== name).map((a) => `${a}(${s.agents[a].model ?? s.agents[a].kind})`).join(", ");
+  const others = Object.keys(s.agents).filter((a) => a !== name);
+  const roster = others.map((a) => `${a} [모델 ${s.agents[a].model ?? s.agents[a].kind}]`).join(", ");
   const role = s.agents[name].role ? `\n${s.agents[name].role}\n` : "";
-  return `너는 공유 세션 ${s.sid}의 참여자 "${name}"이다. 다른 참여자: ${others}. 사용자(user)도 있다.${role}
+  return `너는 공유 세션 ${s.sid}의 참여자 "${name}"이다. 다른 참여자: ${roster}. 사용자(user)도 있다.${role}
 작업 디렉터리: ${s.cwd}. 모든 참여자의 발언은 하나의 공유 트랜스크립트에 기록되고, 네 차례가 오면 네 마지막 턴 이후의 발언을 먼저 보여준다.
 규칙:
-- 다른 참여자에게 직접 말하거나 일을 넘기려면 줄 맨 앞에 "@이름: "을 붙인다 (예: "@${others.split(", ")[0] ?? "codex"}: 이 diff 검토해줘"). 오케스트레이터가 그 줄을 전달한다.
+- 다른 참여자에게 직접 말하거나 일을 넘기려면 새 줄 맨 앞에 정확히 "@이름: " 을 쓴다 (예: "@${others[0] ?? "codex"}: 이 diff 검토해줘"). 이름 뒤에 괄호·모델명·굵게 표시를 붙이지 않는다. 그 줄부터 다음 "@이름:" 줄 전까지의 내용이 통째로 그 참여자에게 전달되므로, 지시는 멘션 줄 아래에 여러 줄로 써도 된다. 전달은 오케스트레이터가 자동으로 한다. 답을 "기다리겠다"고 말할 필요 없이, 전달 후 상대 턴이 끝나면 네게 다시 차례가 온다.
 - 사용자에게 하는 말은 접두어 없이 쓴다.
 - 같은 파일을 다른 참여자가 막 수정했다고 보이면 먼저 읽고 나서 고친다. 이미 끝난 일은 반복하지 않는다.
 - 답은 간결하고 구체적으로.`;
@@ -133,17 +134,28 @@ async function turn(s: Session, to: string, msg: Entry, hops = 0): Promise<void>
   save(s);
   const out = append(s.sid, { from: to, to: "user", text: reply });
   console.log(`\n[${to}] ${reply}\n`);
-  // agent → agent forwarding: lines starting with "@name:"
+  // agent → agent forwarding: each "@name:" header line plus everything under it until the next header
   if (hops >= MAX_HOPS) return;
-  const re = /^@([\w-]+):\s*(.+)$/gm;
-  for (const m of reply.matchAll(re)) {
-    const [, target, text] = m;
-    if (s.agents[target] && target !== to) {
-      const fwd = append(s.sid, { from: to, to: target, text });
-      out.to = target;
-      await turn(s, target, fwd, hops + 1);
-    }
+  for (const [target, text] of mentions(reply, Object.keys(s.agents))) {
+    if (target === to) continue;
+    const fwd = append(s.sid, { from: to, to: target, text });
+    out.to = target;
+    await turn(s, target, fwd, hops + 1);
   }
+}
+
+// Accepts "@planner:", "**@planner:**", "@planner(gpt-6-astra):", "@planner :" — models drift on the exact form.
+const HEADER = /^\s*(?:\*\*)?@([\w-]+)(?:\s*\([^)]*\))?(?:\*\*)?\s*[:：]\s*(?:\*\*)?\s*(.*)$/;
+export function mentions(text: string, known: string[]): Array<[string, string]> {
+  const out: Array<[string, string]> = [];
+  let cur: [string, string[]] | null = null;
+  for (const line of text.split("\n")) {
+    const m = line.match(HEADER);
+    if (m && known.includes(m[1])) { if (cur) out.push([cur[0], cur[1].join("\n").trim()]); cur = [m[1], [m[2]]]; }
+    else if (cur) cur[1].push(line);
+  }
+  if (cur) out.push([cur[0], cur[1].join("\n").trim()]);
+  return out.filter(([, t]) => t.length > 0);
 }
 
 async function say(s: Session, to: string, text: string) {
@@ -239,7 +251,18 @@ async function cmdChat([sid]: string[]) {
 }
 
 const [cmd, ...args] = process.argv.slice(2);
-const cmds: Record<string, (a: string[]) => unknown> = { new: cmdNew, run: cmdRun, chat: cmdChat, show: cmdShow, list: cmdList, current: () => console.log(findForCwd(process.cwd()) ?? ""),
+// `agentsession selftest [file]` — the one check that fails if mention parsing breaks; with a file, prints what would be forwarded
+function cmdSelftest([file]: string[]) {
+  const known = ["pm", "planner", "dev-terra", "dev-lite"];
+  if (file) { for (const [t, x] of mentions(readFileSync(file, "utf8"), known)) console.log(`→ ${t}: ${x.slice(0, 120).replace(/\n/g, " | ")}`); return; }
+  const sample = "확인했습니다.\n\n@planner(gpt-6-astra): 결정 사항 확정.\n- 화면은 master 기준\n- 스타일은 feature/pjk\n\n**@dev-lite:** 인증 API 레이어 복원\n@unknown: 무시\n@pm: 보고 형식은 표로.";
+  const got = mentions(sample, known);
+  const want = JSON.stringify([["planner", "결정 사항 확정.\n- 화면은 master 기준\n- 스타일은 feature/pjk"], ["dev-lite", "인증 API 레이어 복원\n@unknown: 무시"], ["pm", "보고 형식은 표로."]]);
+  if (JSON.stringify(got) !== want) { console.error("SELFTEST FAIL", JSON.stringify(got, null, 1)); process.exit(1); }
+  console.log("selftest ok");
+}
+
+const cmds: Record<string, (a: string[]) => unknown> = { new: cmdNew, run: cmdRun, chat: cmdChat, show: cmdShow, list: cmdList, selftest: cmdSelftest, current: () => console.log(findForCwd(process.cwd()) ?? ""),
   // Claude Code SessionStart hook: tell the user this folder's team session (valid JSON, nothing if none)
   hook: () => { const sid = findForCwd(process.cwd()); if (sid) console.log(JSON.stringify({ systemMessage: `이 폴더의 공유 팀 세션: ${sid} → 터미널에서 'agentsession' (인자 없이)로 이어가기. 이 Claude 세션에서 팀원에게 시키려면: agentsession run ${sid} <agent> "<메시지>"` })); } };
 if (!cmd) await cmdAuto();
