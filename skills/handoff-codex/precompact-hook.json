@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "matcher": "auto",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.claude/skills/handoff-codex/handoff-codex.sh --hook 2>/dev/null || true",
+            "timeout": 30,
+            "statusMessage": "Codex 핸드오프 파일 저장 중..."
+          }
+        ]
+      }
+    ]
+  }
+}
