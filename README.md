@@ -12,9 +12,13 @@
 ## 설치 (다른 머신)
 
 ```bash
-git clone <this repo> ~/.agentsession && ~/.agentsession/install.sh
+git clone https://github.com/Shin-Yu-1/with_u.git ~/.agentsession && ~/.agentsession/install.sh
 ```
-마지막 단계에 출력되는 Claude 쪽 명령 3개는 직접 실행한다 (Claude Code가 자기 설정 편집을 승인 없이 못 함).
+없는 것은 전부 설치한다: Node(nvm), bun, claude/codex CLI, 로그인(필요 시 브라우저 열림), Claude 플러그인(ECC, Ponytail), gstack, ECC-for-Codex, Memory Vault + MCP(양쪽), 스킬, 훅. 다시 실행해도 안전(idempotent).
+
+- `./install.sh --check`   무엇이 있고 없는지만 보고, 아무것도 바꾸지 않음
+- `./install.sh --minimal` Claude 플러그인·gstack 건너뜀 (agentsession 핵심만)
+- 일반 터미널에서 실행한다. Claude Code 세션 안에서 실행하면 8단계(Claude 설정 편집)는 건너뛰고 안내만 출력한다.
 
 ## 사용
 
