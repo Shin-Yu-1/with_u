@@ -133,6 +133,15 @@ try {
   ok("stop", removed);
   assert.ok(ok("list").includes(kept), "stopping one session must leave other sessions alone");
   assert.equal(ok("current"), kept);
+  const terminal = seed();
+  const tui = spawnSync("python3", [join(import.meta.dir, "tui-pty.test.py"), process.execPath, ...cli("chat", terminal)], { encoding: "utf8", timeout: 15000 });
+  assert.equal(tui.status, 0, tui.stderr || tui.error?.message);
+  assert.ok(existsSync(join(scratch, "aborted-codex" + terminal)), "TUI quit must cancel the SDK");
+  assert.ok(!ok("list").includes(terminal));
+  const terminalLog = ok("show", terminal);
+  assert.ok(terminalLog.includes("한글 👩‍💻"));
+  assert.ok(!terminalLog.includes("missing"), "invalid recipients must not enter shared history");
+  console.log(tui.stdout.trim());
   console.log("session lifecycle checks passed (stop, history, validation, quit, EOF, signals, both SDK cancellations)");
 } finally {
   for (const child of children) {
