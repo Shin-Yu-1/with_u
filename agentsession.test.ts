@@ -16,11 +16,35 @@ const preload = join(scratch, "preload.ts");
 const entry = join(import.meta.dir, "agentsession.ts");
 writeFileSync(preload, `
 import { mock, spyOn } from "bun:test";
-import { writeFileSync } from "node:fs";
+import { writeFileSync, appendFileSync } from "node:fs";
 import os from "node:os";
 spyOn(os, "homedir").mockReturnValue(${JSON.stringify(scratch)});
-async function* events(signal, kind, prompt) {
+async function* events(signal, kind, prompt, options = {}) {
+  appendFileSync(${JSON.stringify(scratch)} + "/calls.jsonl", JSON.stringify({ kind, prompt, model: options.model, resume: options.resume, system: options.systemPrompt }) + "\\n");
   prompt = prompt.slice(prompt.lastIndexOf("[user →"));
+  const scenario = prompt.match(/FAILOVER_(claude|codex)_(THROW|RESULT|EVENT|EMPTY|PARTIAL|AUTH|CONTEXT)/);
+  if (scenario && scenario[1] === kind) {
+    const failure = scenario[2];
+    if (failure === "EMPTY") return;
+    if (failure === "THROW") throw new Error("You've hit your weekly limit · resets Sep 20 at 10pm (Asia/Seoul)");
+    if (failure === "AUTH") throw new Error("authentication token expired");
+    if (failure === "CONTEXT") throw new Error("context window exceeded; session expired");
+    if (failure === "PARTIAL") yield { type: "item.completed", item: { type: "agent_message", text: "incomplete answer" } };
+    yield kind === "claude"
+      ? failure === "RESULT"
+        ? { type: "result", subtype: "success", is_error: true, result: "weekly limit reached", session_id: "failed-native" }
+        : { type: "result", subtype: "error_during_execution", errors: ["session expired"], session_id: "failed-native" }
+      : failure === "EVENT"
+        ? { type: "error", message: "session expired" }
+        : { type: "turn.failed", error: { message: "token limit exceeded" } };
+    return;
+  }
+  if (scenario) {
+    yield kind === "codex"
+      ? { type: "item.completed", item: { type: "agent_message", text: "fallback done" } }
+      : { type: "result", subtype: "success", result: "fallback done", session_id: "test-claude" };
+    return;
+  }
   if (prompt.includes("TEST_SUCCESS")) {
     yield kind === "codex"
       ? { type: "item.completed", item: { type: "agent_message", text: "done" } }
@@ -35,9 +59,10 @@ async function* events(signal, kind, prompt) {
   writeFileSync(${JSON.stringify(scratch)} + "/aborted-" + kind + sid, "yes");
   signal.throwIfAborted();
 }
-mock.module(${JSON.stringify(import.meta.resolve("@anthropic-ai/claude-agent-sdk"))}, () => ({ query: ({ prompt, options }) => events(options.abortController?.signal, "claude", prompt) }));
+mock.module(${JSON.stringify(import.meta.resolve("@anthropic-ai/claude-agent-sdk"))}, () => ({ query: ({ prompt, options }) => events(options.abortController?.signal, "claude", prompt, options) }));
 mock.module(${JSON.stringify(import.meta.resolve("@openai/codex-sdk"))}, () => ({ Codex: class {
-  startThread() { return { runStreamed: async (prompt, options) => ({ events: events(options?.signal, "codex", prompt) }) }; }
+  startThread(settings = {}) { return { id: "test-codex", runStreamed: async (prompt, options) => ({ events: events(options?.signal, "codex", prompt, settings) }) }; }
+  resumeThread(id, settings) { return this.startThread({ ...settings, resume: id }); }
 } }));
 `);
 const cli = (...args: string[]) => ["--preload", preload, entry, ...args];
@@ -76,6 +101,43 @@ const waitFor = async (predicate: () => boolean, message: string | (() => string
 };
 
 try {
+  const calls = () => readFileSync(join(scratch, "calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+  for (const kind of ["claude", "codex"]) {
+    for (const failure of ["THROW", "RESULT", "EVENT", "EMPTY", "PARTIAL", "AUTH", "CONTEXT"]) {
+      if (kind === "claude" && failure === "PARTIAL") continue;
+      const sid = seed();
+      const path = join(scratch, ".agent-sessions", sid, "session.json");
+      const other = kind === "claude" ? "codex" : "claude";
+      const s = JSON.parse(readFileSync(path, "utf8"));
+      s.agents = {
+        pm: { kind, model: "primary-model", role: "ROLE_KEEP", native: "old-primary", lastSeq: 1 },
+        helper: { kind: other, model: "backup-model", role: "OTHER_ROLE", native: "unrelated-native", lastSeq: 99 },
+      };
+      writeFileSync(path, JSON.stringify(s));
+      writeFileSync(join(scratch, ".agent-sessions", sid, "transcript.jsonl"), JSON.stringify({ seq: 1, ts: new Date().toISOString(), from: "pm", to: "user", text: "earlier decision" }) + "\n");
+      writeFileSync(join(scratch, "calls.jsonl"), "");
+      const result = invoke("run", sid, "pm", `FAILOVER_${kind}_${failure}`);
+      assert.equal(result.status, 0, result.stderr);
+      assert.ok(result.stdout.includes("[pm] fallback done"), result.stdout);
+      const attempts = calls();
+      assert.deepEqual(attempts.map(c => c.kind), [kind, other]);
+      assert.equal(attempts[1].resume, undefined, "never reuse another agent/provider's native session");
+      assert.equal(attempts[1].model, "backup-model");
+      assert.ok(JSON.stringify(attempts[1]).includes("ROLE_KEEP"));
+      assert.ok(!JSON.stringify(attempts[1]).includes("OTHER_ROLE"));
+      assert.ok(attempts[1].prompt.includes("earlier decision"), "handoff includes this role's earlier answers");
+      const saved = JSON.parse(readFileSync(path, "utf8"));
+      assert.equal(saved.agents.pm.kind, other);
+      assert.equal(saved.agents.pm.role, "ROLE_KEEP");
+      assert.deepEqual(saved.agents.helper, s.agents.helper);
+      assert.ok(!ok("show", sid).includes("incomplete answer"));
+      writeFileSync(join(scratch, "calls.jsonl"), "");
+      assert.ok(ok("run", sid, "pm", "TEST_SUCCESS").includes("done"));
+      assert.deepEqual(calls().map(c => c.kind), [other], "successful fallback is preferred across CLI invocations");
+      assert.equal(calls()[0].resume, `test-${other}`);
+      ok("stop", sid);
+    }
+  }
   const sid = seed();
   ok("stop", sid); // RED on the original CLI: stop is not a command.
   assert.ok(!ok("list").includes(sid));
@@ -116,6 +178,7 @@ try {
     const failure = invoke("run", failed, kind, "TEST_FAILURE");
     assert.equal(failure.status, 1);
     assert.ok(failure.stderr.includes("test SDK failure"));
+    assert.ok(failure.stderr.includes("claude") && failure.stderr.includes("codex"), "both causes must be reported");
     ok("stop", failed);
   }
 
