@@ -4,6 +4,11 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, existsSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { wrap } from "./tui";
+
+assert.deepEqual(wrap("한글 👩‍💻e\u0301\n끝", 4), ["한글", " 👩‍💻e\u0301", "끝"]);
+assert.deepEqual(wrap("\x1b[31mred\x1b[0m\x1b]52;c;hidden\x07\r!", 10), ["red!"]);
+assert.deepEqual(wrap("한a", 1), ["a"]);
 
 // Run the real CLI with isolated storage and SDKs that block until cancelled; no API calls.
 const scratch = mkdtempSync(join(tmpdir(), "agentsession-test-"));
@@ -15,6 +20,7 @@ import { writeFileSync } from "node:fs";
 import os from "node:os";
 spyOn(os, "homedir").mockReturnValue(${JSON.stringify(scratch)});
 async function* events(signal, kind, prompt) {
+  prompt = prompt.slice(prompt.lastIndexOf("[user →"));
   if (prompt.includes("TEST_SUCCESS")) {
     yield kind === "codex"
       ? { type: "item.completed", item: { type: "agent_message", text: "done" } }
@@ -133,15 +139,22 @@ try {
   ok("stop", removed);
   assert.ok(ok("list").includes(kept), "stopping one session must leave other sessions alone");
   assert.equal(ok("current"), kept);
-  const terminal = seed();
-  const tui = spawnSync("python3", [join(import.meta.dir, "tui-pty.test.py"), process.execPath, ...cli("chat", terminal)], { encoding: "utf8", timeout: 15000 });
-  assert.equal(tui.status, 0, tui.stderr || tui.error?.message);
-  assert.ok(existsSync(join(scratch, "aborted-codex" + terminal)), "TUI quit must cancel the SDK");
-  assert.ok(!ok("list").includes(terminal));
-  const terminalLog = ok("show", terminal);
-  assert.ok(terminalLog.includes("한글 👩‍💻"));
-  assert.ok(!terminalLog.includes("missing"), "invalid recipients must not enter shared history");
-  console.log(tui.stdout.trim());
+  for (const mode of ["full", "ctrlc", "eof", "sigterm", "external", "plain", "dumb"]) {
+    const terminal = seed();
+    writeFileSync(join(scratch, ".agent-sessions", terminal, "transcript.jsonl"), JSON.stringify({ seq: 1, ts: new Date().toISOString(), from: "user", to: "codex", text: Array.from({ length: 35 }, (_, i) => `history-${i}`).join("\n") }) + "\n");
+    const tui = spawnSync("python3", [join(import.meta.dir, "tui-pty.test.py"), process.execPath, ...cli("chat", terminal), ...(mode === "plain" ? ["--plain"] : [])], {
+      encoding: "utf8", timeout: 15000, env: { ...process.env, TUI_TEST_MODE: mode },
+    });
+    assert.equal(tui.status, 0, tui.stderr || tui.error?.message);
+    if (mode === "full") {
+      assert.ok(existsSync(join(scratch, "aborted-codex" + terminal)), "TUI quit must cancel the SDK");
+      const terminalLog = ok("show", terminal);
+      assert.ok(terminalLog.includes("한글 👩‍💻"));
+      assert.ok(!terminalLog.includes("missing"), "invalid recipients must not enter shared history");
+    }
+    assert.ok(!ok("list").includes(terminal));
+    console.log(tui.stdout.trim());
+  }
   console.log("session lifecycle checks passed (stop, history, validation, quit, EOF, signals, both SDK cancellations)");
 } finally {
   for (const child of children) {

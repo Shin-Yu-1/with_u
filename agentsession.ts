@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import os from "node:os";
 import * as readline from "node:readline";
+import { ChatTui } from "./tui";
 
 const ROOT = join(os.homedir(), ".agent-sessions");
 const MAX_HOPS = 8; // agent→agent auto-forward limit per user message (pm→planner→pm→dev→pm→reviewer→pm fits)
@@ -125,7 +126,11 @@ async function runClaude(s: Session, name: string, prompt: string): Promise<stri
 }
 
 // live progress line while an agent works (tool name + a short arg), so a long turn never looks hung
-const progress = (who: string, what: string) => process.stdout.write(`   ${who} · ${what.slice(0, 110)}\n`);
+let tui: ChatTui | undefined;
+const progress = (who: string, what: string) => {
+  if (tui) tui.setStatus(`${who} · ${what}`);
+  else process.stdout.write(`   ${who} · ${what.slice(0, 110)}\n`);
+};
 const brief = (input: any) => String(input?.command ?? input?.file_path ?? input?.pattern ?? input?.path ?? input?.description ?? "").slice(0, 80);
 
 async function runCodex(s: Session, name: string, prompt: string): Promise<string> {
@@ -158,13 +163,14 @@ async function turn(s: Session, to: string, msg: Entry, hops = 0): Promise<void>
   if (!st) { console.error(`unknown agent: ${to}`); return; }
   const entries = transcript(s.sid);
   const prompt = buildPrompt(s, to, entries, msg);
-  process.stdout.write(`\n── ${to} 생각 중…\n`);
+  progress(to, "생각 중…");
   const reply = await RUN[st.kind](s, to, prompt);
   ensureActive(s.sid);
   st.lastSeq = transcript(s.sid).length; // everything up to now has been shown to it
   save(s);
   const out = append(s.sid, { from: to, to: "user", text: reply });
-  console.log(`\n[${to}] ${reply}\n`);
+  if (tui) tui.write(`[${to}] ${reply}`);
+  else console.log(`\n[${to}] ${reply}\n`);
   // agent → agent forwarding: each "@name:" header line plus everything under it until the next header
   if (hops >= MAX_HOPS) return;
   for (const [target, text] of mentions(reply, Object.keys(s.agents))) {
@@ -191,7 +197,9 @@ export function mentions(text: string, known: string[]): Array<[string, string]>
 }
 
 async function say(s: Session, to: string, text: string) {
+  if (to !== "all" && !Object.hasOwn(s.agents, to)) throw new Error(`unknown agent: ${to}`);
   const targets = to === "all" ? Object.keys(s.agents) : [to];
+  if (tui) tui.write(`[you → ${to}] ${text}`);
   for (const t of targets) {
     ensureActive(s.sid);
     const e = append(s.sid, { from: "user", to: t, text });
@@ -274,13 +282,20 @@ async function cmdAuto() {
   await cmdChat([sid!]);
 }
 
-async function cmdChat([sid]: string[]) {
+async function cmdChat(args: string[]) {
+  const sid = args.find(arg => arg !== "--plain");
   if (!sid) return cmdAuto();
   const s = load(sid);
   const cleanup = watchSession(sid);
+  if (process.stdin.isTTY && process.stdout.isTTY && process.env.TERM !== "dumb" && !process.argv.includes("--plain")) {
+    try { await chatTui(s); }
+    finally { cleanup(); }
+    return;
+  }
   console.log(`공유 세션 ${sid} — 참여자: ${Object.entries(s.agents).map(([n, a]) => `${n}(${a.model ?? a.kind})`).join(", ")} (기본: ${s.default})`);
   console.log(`입력: "@codex ...", "@claude ...", "@all ...", 그냥 쓰면 ${s.default}에게. /quit 종료`);
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  // Plain mode leaves terminal editing to the OS and emits no cursor controls.
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
   const close = () => rl.close();
   abortController.signal.addEventListener("abort", close, { once: true });
   rl.on("SIGINT", () => stopSession(sid));
@@ -307,6 +322,43 @@ async function cmdChat([sid]: string[]) {
   }
 }
 
+async function chatTui(s: Session) {
+  const history = transcript(s.sid).map(e => `[${e.from} → ${e.to}] ${e.text}`);
+  const view = new ChatTui(`agentsession · ${s.sid}`, Object.entries(s.agents)
+    .map(([name, agent]) => `${name === s.default ? "*" : ""}${name} (${agent.model ?? agent.kind})`).join(" · "), history);
+  tui = view;
+  let pending: Promise<void> | undefined;
+  const close = () => view.close();
+  const closed = new Promise<void>(resolve => view.input.once("close", resolve));
+  view.input.on("SIGINT", close);
+  view.input.once("close", () => stopSession(s.sid));
+  abortController.signal.addEventListener("abort", close, { once: true });
+  view.input.on("line", (input: string) => {
+    const line = input.trim();
+    if (line === "/quit" || line === "/q") { close(); return; }
+    if (!line || abortController.signal.aborted) return;
+    if (pending) {
+      view.input.write(input); // Keep the draft so Enter during a turn cannot lose it.
+      view.setStatus("작업 중 · 완료 후 Enter로 전송 · /quit 종료");
+      return;
+    }
+    const match = line.match(/^@([\w-]+)\s+([\s\S]+)$/);
+    const [to, text] = match ? [match[1], match[2]] : [s.default, line];
+    pending = say(s, to, text).catch(e => {
+      if (!abortController.signal.aborted) view.write(`error: ${(e as Error).message}`);
+    }).finally(() => {
+      pending = undefined;
+      view.setStatus("대기 중");
+    });
+  });
+  try { await closed; await pending; }
+  finally {
+    abortController.signal.removeEventListener("abort", close);
+    close();
+    tui = undefined;
+  }
+}
+
 const [cmd, ...args] = process.argv.slice(2);
 // `agentsession selftest [file]` — the one check that fails if mention parsing breaks; with a file, prints what would be forwarded
 function cmdSelftest([file]: string[]) {
@@ -323,7 +375,7 @@ const cmds: Record<string, (a: string[]) => unknown> = { new: cmdNew, run: cmdRu
   // Claude Code SessionStart hook: tell the user this folder's team session (valid JSON, nothing if none)
   hook: () => { const sid = findForCwd(process.cwd()); if (sid) console.log(JSON.stringify({ systemMessage: `이 폴더의 공유 팀 세션: ${sid} → 터미널에서 'agentsession' (인자 없이)로 이어가기. 이 Claude 세션에서 팀원에게 시키려면: agentsession run ${sid} <agent> "<메시지>"` })); } };
 try {
-  if (!cmd) await cmdAuto();
+  if (!cmd || cmd === "--plain") await cmdAuto();
   else if (!cmds[cmd]) { console.error("usage: agentsession [new|run|chat|show|list|stop|current]  — 인자 없이 실행하면 현재 폴더 세션 이어가기/생성 후 chat"); process.exitCode = 2; }
   else await cmds[cmd](args);
 } catch (e) {

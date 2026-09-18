@@ -40,6 +40,12 @@ Ponytail 규칙은 `roles.json`의 `_ponytail`, ECC 사용 규칙은 `_ecc_claud
 가장 짧은 사용법: 프로젝트 폴더에서 **`agentsession`** (인자 없음). 이 폴더의 최근 공유 세션을 이어가고, 없으면 기본 팀을 만들고, 세션 ID를 알려준 뒤 바로 chat에 들어간다.
 `agentsession current`는 이 폴더의 세션 ID만 출력한다 (스크립트·훅용).
 
+터미널에서는 `agentsession` 또는 `agentsession chat <sid>`가 전체 화면 TUI를 연다.
+상단에 세션·참여자(`*`는 기본 에이전트), 중앙에 대화, 하단에 작업 상태와 입력창을 표시한다.
+`@이름 메시지` 또는 `@all 메시지`로 전송하고, PgUp/PgDn으로 이전 대화를 본다. 방향키·Ctrl+U 등 readline 입력 편집도 사용할 수 있다.
+작업 중에도 초안을 작성할 수 있으며, 완료 후 Enter로 보낸다. `/quit`, `/q`, Ctrl+C는 진행 중인 작업까지 취소하고 터미널을 복원한다.
+기존 줄 단위 화면은 `agentsession --plain` 또는 `agentsession chat <sid> --plain`으로 실행한다. 파이프와 `TERM=dumb`에서는 자동으로 일반 화면을 사용한다.
+
 ```bash
 cd <project>
 SID=$(agentsession new)                 # 기본 팀. --team <이름> 으로 다른 팀
@@ -61,4 +67,4 @@ agentsession stop $SID                  # ID로 세션 종료 (진행 중인 에
 
 `~/.agent-sessions/<sid>/session.json` (참여자, 네이티브 세션 ID), `transcript.jsonl` (공유 기록), `stopped` (종료 표시).
 
-검증: `bun agentsession.test.ts` (임시 저장소와 SDK 대역을 사용한 CLI 종료 회귀 검사), `bun agentsession.ts selftest` (멘션 파싱).
+검증: `bun agentsession.test.ts` (임시 저장소와 SDK 대역을 사용한 CLI/TUI 회귀 검사, PTY 검사는 Python 3 필요), `bun agentsession.ts selftest` (멘션 파싱).
