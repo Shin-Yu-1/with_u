@@ -10,25 +10,30 @@
  *   agentsession chat <sid>              # REPL: "@codex ...", "@claude ...", "@all ...", plain -> default
  *   agentsession show <sid> [n]
  *   agentsession list
+ *   agentsession stop <sid>
  */
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { Codex } from "@openai/codex-sdk";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import os from "node:os";
 import * as readline from "node:readline";
 
-const ROOT = join(process.env.HOME ?? "~", ".agent-sessions");
+const ROOT = join(os.homedir(), ".agent-sessions");
 const MAX_HOPS = 8; // agent→agent auto-forward limit per user message (pm→planner→pm→dev→pm→reviewer→pm fits)
 
 type Kind = "claude" | "codex";
 interface AgentState { kind: Kind; model?: string; effort?: string; role?: string; native?: string; lastSeq: number }
-const ROLES_FILE = join(process.env.HOME ?? "~", ".agentsession", "roles.json");
+const ROLES_FILE = join(os.homedir(), ".agentsession", "roles.json");
 interface Session { sid: string; cwd: string; created: string; default: string; agents: Record<string, AgentState> }
 interface Entry { seq: number; ts: string; from: string; to: string; text: string }
 
 // ---------- store ----------
-const dir = (sid: string) => join(ROOT, sid);
+const dir = (sid: string) => {
+  if (!/^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i.test(sid ?? "")) throw new Error("a valid session ID is required");
+  return join(ROOT, sid);
+};
 const load = (sid: string): Session => {
   const p = join(dir(sid), "session.json");
   if (!existsSync(p)) throw new Error(`no such session: ${sid}`);
@@ -46,6 +51,29 @@ const append = (sid: string, e: Omit<Entry, "seq" | "ts">): Entry => {
   appendFileSync(join(dir(sid), "transcript.jsonl"), JSON.stringify(entry) + "\n");
   return entry;
 };
+
+// Keep the stop marker separate so a finishing turn cannot overwrite it with stale session data.
+const stopped = (sid: string) => existsSync(join(dir(sid), "stopped"));
+const abortController = new AbortController(); // One CLI invocation handles one session.
+const ensureActive = (sid: string) => {
+  if (stopped(sid) || abortController.signal.aborted) throw new Error(`session stopped: ${sid}`);
+};
+const stopSession = (sid: string) => {
+  writeFileSync(join(dir(sid), "stopped"), new Date().toISOString());
+  abortController.abort();
+};
+function watchSession(sid: string) {
+  ensureActive(sid);
+  const stop = () => stopSession(sid);
+  const check = () => { if (stopped(sid)) abortController.abort(); };
+  // ponytail: local-file polling adds up to 200 ms; use IPC if immediate cancellation is needed.
+  const timer = setInterval(check, 200);
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, stop);
+  return () => {
+    clearInterval(timer);
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.off(signal, stop);
+  };
+}
 
 // ---------- prompts ----------
 const systemPrompt = (s: Session, name: string) => {
@@ -75,6 +103,7 @@ async function runClaude(s: Session, name: string, prompt: string): Promise<stri
   const st = s.agents[name];
   let text = "";
   const opts: Record<string, unknown> = {
+    abortController,
     cwd: s.cwd,
     permissionMode: "acceptEdits",
     ...(st.model ? { model: st.model } : {}),
@@ -108,7 +137,7 @@ async function runCodex(s: Session, name: string, prompt: string): Promise<strin
   } as any;
   const thread = st.native ? codex.resumeThread(st.native, topts) : codex.startThread(topts);
   const full = st.native ? prompt : `${systemPrompt(s, name)}\n\n${prompt}`;
-  const { events } = await thread.runStreamed(full);
+  const { events } = await thread.runStreamed(full, { signal: abortController.signal });
   let final = "";
   for await (const ev of events as AsyncGenerator<any>) {
     if (ev.type === "item.started" && ev.item?.type === "command_execution") progress(name, `Bash ${String(ev.item.command ?? "").slice(0, 80)}`);
@@ -124,12 +153,14 @@ const RUN: Record<Kind, typeof runClaude> = { claude: runClaude, codex: runCodex
 
 // ---------- turn engine ----------
 async function turn(s: Session, to: string, msg: Entry, hops = 0): Promise<void> {
+  ensureActive(s.sid);
   const st = s.agents[to];
   if (!st) { console.error(`unknown agent: ${to}`); return; }
   const entries = transcript(s.sid);
   const prompt = buildPrompt(s, to, entries, msg);
   process.stdout.write(`\n── ${to} 생각 중…\n`);
   const reply = await RUN[st.kind](s, to, prompt);
+  ensureActive(s.sid);
   st.lastSeq = transcript(s.sid).length; // everything up to now has been shown to it
   save(s);
   const out = append(s.sid, { from: to, to: "user", text: reply });
@@ -137,6 +168,7 @@ async function turn(s: Session, to: string, msg: Entry, hops = 0): Promise<void>
   // agent → agent forwarding: each "@name:" header line plus everything under it until the next header
   if (hops >= MAX_HOPS) return;
   for (const [target, text] of mentions(reply, Object.keys(s.agents))) {
+    ensureActive(s.sid);
     if (target === to) continue;
     const fwd = append(s.sid, { from: to, to: target, text });
     out.to = target;
@@ -161,6 +193,7 @@ export function mentions(text: string, known: string[]): Array<[string, string]>
 async function say(s: Session, to: string, text: string) {
   const targets = to === "all" ? Object.keys(s.agents) : [to];
   for (const t of targets) {
+    ensureActive(s.sid);
     const e = append(s.sid, { from: "user", to: t, text });
     await turn(s, t, e);
   }
@@ -194,7 +227,16 @@ function cmdNew(args: string[]) {
 
 async function cmdRun([sid, to, ...rest]: string[]) {
   const s = load(sid);
-  await say(s, to, rest.join(" "));
+  const cleanup = watchSession(sid);
+  try { await say(s, to, rest.join(" ")); }
+  catch (e) { if (!abortController.signal.aborted) throw e; }
+  finally { cleanup(); }
+}
+
+function cmdStop([sid]: string[]) {
+  load(sid);
+  stopSession(sid);
+  console.log(`session stopped: ${sid}`);
 }
 
 function cmdShow([sid, n]: string[]) {
@@ -208,7 +250,7 @@ function cmdList() {
   if (!existsSync(ROOT)) return;
   for (const d of readdirSync(ROOT)) {
     const p = join(ROOT, d, "session.json");
-    if (!existsSync(p)) continue;
+    if (!existsSync(p) || existsSync(join(ROOT, d, "stopped"))) continue;
     const s: Session = JSON.parse(readFileSync(p, "utf8"));
     console.log(`${s.sid}  ${s.created.slice(0, 16)}  ${Object.keys(s.agents).join(",")}  ${s.cwd}`);
   }
@@ -219,7 +261,7 @@ function findForCwd(cwd: string): string | undefined {
   if (!existsSync(ROOT)) return;
   const hits = readdirSync(ROOT)
     .map((d) => join(ROOT, d, "session.json")).filter(existsSync)
-    .map((p) => JSON.parse(readFileSync(p, "utf8")) as Session).filter((s) => s.cwd === cwd)
+    .map((p) => JSON.parse(readFileSync(p, "utf8")) as Session).filter((s) => s.cwd === cwd && !stopped(s.sid))
     .sort((a, b) => b.created.localeCompare(a.created));
   return hits[0]?.sid;
 }
@@ -235,19 +277,34 @@ async function cmdAuto() {
 async function cmdChat([sid]: string[]) {
   if (!sid) return cmdAuto();
   const s = load(sid);
+  const cleanup = watchSession(sid);
   console.log(`공유 세션 ${sid} — 참여자: ${Object.entries(s.agents).map(([n, a]) => `${n}(${a.model ?? a.kind})`).join(", ")} (기본: ${s.default})`);
   console.log(`입력: "@codex ...", "@claude ...", "@all ...", 그냥 쓰면 ${s.default}에게. /quit 종료`);
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  const ask = () => new Promise<string>((r) => rl.question("you> ", r));
-  for (;;) {
-    const line = (await ask()).trim();
-    if (!line) continue;
-    if (line === "/quit" || line === "/q") break;
-    const m = line.match(/^@([\w-]+)\s+([\s\S]+)$/);
-    const [to, text] = m ? [m[1], m[2]] : [s.default, line];
-    try { await say(s, to, text); } catch (e) { console.error(`error: ${(e as Error).message}`); }
+  const close = () => rl.close();
+  abortController.signal.addEventListener("abort", close, { once: true });
+  rl.on("SIGINT", () => stopSession(sid));
+  rl.once("close", () => stopSession(sid));
+  rl.setPrompt("you> ");
+  rl.prompt();
+  try {
+    for await (const input of rl) {
+      if (abortController.signal.aborted) break;
+      const line = input.trim();
+      if (line === "/quit" || line === "/q") break;
+      if (line) {
+        const m = line.match(/^@([\w-]+)\s+([\s\S]+)$/);
+        const [to, text] = m ? [m[1], m[2]] : [s.default, line];
+        try { await say(s, to, text); }
+        catch (e) { if (!abortController.signal.aborted) console.error(`error: ${(e as Error).message}`); }
+      }
+      if (!abortController.signal.aborted) rl.prompt();
+    }
+  } finally {
+    close();
+    abortController.signal.removeEventListener("abort", close);
+    cleanup();
   }
-  rl.close();
 }
 
 const [cmd, ...args] = process.argv.slice(2);
@@ -262,9 +319,14 @@ function cmdSelftest([file]: string[]) {
   console.log("selftest ok");
 }
 
-const cmds: Record<string, (a: string[]) => unknown> = { new: cmdNew, run: cmdRun, chat: cmdChat, show: cmdShow, list: cmdList, selftest: cmdSelftest, current: () => console.log(findForCwd(process.cwd()) ?? ""),
+const cmds: Record<string, (a: string[]) => unknown> = { new: cmdNew, run: cmdRun, chat: cmdChat, show: cmdShow, list: cmdList, stop: cmdStop, selftest: cmdSelftest, current: () => console.log(findForCwd(process.cwd()) ?? ""),
   // Claude Code SessionStart hook: tell the user this folder's team session (valid JSON, nothing if none)
   hook: () => { const sid = findForCwd(process.cwd()); if (sid) console.log(JSON.stringify({ systemMessage: `이 폴더의 공유 팀 세션: ${sid} → 터미널에서 'agentsession' (인자 없이)로 이어가기. 이 Claude 세션에서 팀원에게 시키려면: agentsession run ${sid} <agent> "<메시지>"` })); } };
-if (!cmd) await cmdAuto();
-else if (!cmds[cmd]) { console.error("usage: agentsession [new|run|chat|show|list|current]  — 인자 없이 실행하면 현재 폴더 세션 이어가기/생성 후 chat"); process.exit(2); }
-else await cmds[cmd](args);
+try {
+  if (!cmd) await cmdAuto();
+  else if (!cmds[cmd]) { console.error("usage: agentsession [new|run|chat|show|list|stop|current]  — 인자 없이 실행하면 현재 폴더 세션 이어가기/생성 후 chat"); process.exitCode = 2; }
+  else await cmds[cmd](args);
+} catch (e) {
+  console.error(`error: ${(e as Error).message}`);
+  process.exitCode = 1;
+}

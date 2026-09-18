@@ -46,9 +46,19 @@ SID=$(agentsession new)                 # 기본 팀. --team <이름> 으로 다
 agentsession chat $SID                  # @codex ... / @claude ... / @all ... / 그냥 입력 → 기본 에이전트
 agentsession run  $SID codex "..."      # 스크립트용 단일 턴
 agentsession show $SID
+agentsession list                       # 종료하지 않은 공유 세션 목록
+agentsession stop $SID                  # ID로 세션 종료 (진행 중인 에이전트 작업도 취소)
 ```
 에이전트가 답변 줄 앞에 `@이름: ...`을 쓰면 그 상대에게 자동 전달된다 (최대 4홉).
 
+채팅에서 `/quit`·`/q`, Ctrl+C, 입력 종료 또는 터미널 종료 시 세션을 종료한다.
+종료된 세션은 `list`, `current`, 자동 이어가기에서 제외하고, 같은 ID로 `chat`·`run`을 다시 실행할 수 없다.
+기록은 보존하므로 `agentsession show <sid>`로 조회할 수 있다. `run` 한 번의 정상 완료는 공유 세션을 종료하지 않는다.
+`stop`은 실행 중인 프로세스가 최대 약 200ms 뒤 감지하여 SDK 취소를 요청한다.
+업데이트 전에 켜 둔 프로세스에는 취소 감지가 없으므로 한 번 직접 종료해야 한다. 이전 종료 기록이나 강제 종료(`kill -9`)는 `stop <sid>`로 목록에서 정리한다.
+
 ## 데이터
 
-`~/.agent-sessions/<sid>/session.json` (참여자, 네이티브 세션 ID), `transcript.jsonl` (공유 기록).
+`~/.agent-sessions/<sid>/session.json` (참여자, 네이티브 세션 ID), `transcript.jsonl` (공유 기록), `stopped` (종료 표시).
+
+검증: `bun agentsession.test.ts` (임시 저장소와 SDK 대역을 사용한 CLI 종료 회귀 검사), `bun agentsession.ts selftest` (멘션 파싱).

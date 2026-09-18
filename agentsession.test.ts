@@ -10,19 +10,28 @@ const scratch = mkdtempSync(join(tmpdir(), "agentsession-test-"));
 const preload = join(scratch, "preload.ts");
 const entry = join(import.meta.dir, "agentsession.ts");
 writeFileSync(preload, `
-import { mock } from "bun:test";
+import { mock, spyOn } from "bun:test";
 import { writeFileSync } from "node:fs";
-mock.module("node:os", () => ({ homedir: () => ${JSON.stringify(scratch)} }));
-async function* events(signal, kind) {
-  writeFileSync(${JSON.stringify(scratch)} + "/started-" + kind, "yes");
+import os from "node:os";
+spyOn(os, "homedir").mockReturnValue(${JSON.stringify(scratch)});
+async function* events(signal, kind, prompt) {
+  if (prompt.includes("TEST_SUCCESS")) {
+    yield kind === "codex"
+      ? { type: "item.completed", item: { type: "agent_message", text: "done" } }
+      : { type: "result", subtype: "success", result: "done", session_id: "test-native" };
+    return;
+  }
+  if (prompt.includes("TEST_FAILURE")) throw new Error("test SDK failure");
+  const sid = process.argv[3];
+  writeFileSync(${JSON.stringify(scratch)} + "/started-" + kind + sid, "yes");
   if (!signal) await new Promise(() => {});
   if (!signal.aborted) await new Promise(resolve => signal.addEventListener("abort", resolve, { once: true }));
-  writeFileSync(${JSON.stringify(scratch)} + "/aborted-" + kind, "yes");
+  writeFileSync(${JSON.stringify(scratch)} + "/aborted-" + kind + sid, "yes");
   signal.throwIfAborted();
 }
-mock.module("@anthropic-ai/claude-agent-sdk", () => ({ query: ({ options }) => events(options.abortController?.signal, "claude") }));
-mock.module("@openai/codex-sdk", () => ({ Codex: class {
-  startThread() { return { runStreamed: async (_, options) => ({ events: events(options?.signal, "codex") }) }; }
+mock.module(${JSON.stringify(import.meta.resolve("@anthropic-ai/claude-agent-sdk"))}, () => ({ query: ({ prompt, options }) => events(options.abortController?.signal, "claude", prompt) }));
+mock.module(${JSON.stringify(import.meta.resolve("@openai/codex-sdk"))}, () => ({ Codex: class {
+  startThread() { return { runStreamed: async (prompt, options) => ({ events: events(options?.signal, "codex", prompt) }) }; }
 } }));
 `);
 const cli = (...args: string[]) => ["--preload", preload, entry, ...args];
@@ -52,10 +61,10 @@ const launch = (...args: string[]) => {
   child.stderr!.on("data", chunk => { output += chunk; });
   return { child, output: () => output };
 };
-const waitFor = async (predicate: () => boolean, message: string) => {
+const waitFor = async (predicate: () => boolean, message: string | (() => string)) => {
   const deadline = Date.now() + 3000;
   while (!predicate()) {
-    assert.ok(Date.now() < deadline, message);
+    assert.ok(Date.now() < deadline, typeof message === "function" ? message() : message);
     await new Promise(resolve => setTimeout(resolve, 20));
   }
 };
@@ -75,7 +84,7 @@ try {
   }
   assert.equal(readFileSync(join(scratch, ".agent-sessions", sid, "transcript.jsonl"), "utf8"), "");
 
-  for (const ending of ["/quit", "/q", "EOF", "SIGINT", "SIGTERM", "stop"]) {
+  for (const ending of ["/quit", "/q", "EOF", "SIGINT", "SIGTERM", "SIGHUP", "stop"]) {
     const active = seed();
     const { child, output } = launch("chat", active);
     await waitFor(() => output().includes("you>"), output());
@@ -92,15 +101,38 @@ try {
   }
 
   for (const kind of ["codex", "claude"]) {
+    const completed = seed();
+    assert.ok(ok("run", completed, kind, "TEST_SUCCESS").includes("done"));
+    assert.ok(ok("list").includes(completed), "a completed single turn must keep the shared session reusable");
+    assert.ok(ok("show", completed).includes("done"));
+    ok("stop", completed);
+    const failed = seed();
+    const failure = invoke("run", failed, kind, "TEST_FAILURE");
+    assert.equal(failure.status, 1);
+    assert.ok(failure.stderr.includes("test SDK failure"));
+    ok("stop", failed);
+  }
+
+  for (const [mode, kind, ending] of [["run", "codex", "stop"], ["run", "claude", "stop"], ["chat", "codex", "stop"], ["chat", "claude", "SIGINT"]]) {
     const active = seed();
-    const { child, output } = launch("run", active, kind, "hello");
-    await waitFor(() => existsSync(join(scratch, "started-" + kind)), `${kind} did not start: ${output()}`);
-    ok("stop", active);
-    await waitFor(() => child.exitCode !== null, `${kind} did not exit: ${output()}`);
+    const { child, output } = launch(mode, active, ...(mode === "run" ? [kind, "hello"] : []));
+    if (mode === "chat") {
+      await waitFor(() => output().includes("you>"), output);
+      child.stdin!.write(`@${kind} hello\n`);
+    }
+    await waitFor(() => existsSync(join(scratch, "started-" + kind + active)), () => `${kind} did not start: ${output()}`);
+    if (ending === "stop") ok("stop", active);
+    else child.kill("SIGINT");
+    await waitFor(() => child.exitCode !== null, () => `${kind} did not exit: ${output()}`);
     assert.equal(child.exitCode, 0, output());
-    assert.ok(existsSync(join(scratch, "aborted-" + kind)), `${kind} SDK was not cancelled`);
+    assert.ok(existsSync(join(scratch, "aborted-" + kind + active)), `${kind} SDK was not cancelled`);
     assert.ok(!ok("list").includes(active));
   }
+  const kept = seed();
+  const removed = seed();
+  ok("stop", removed);
+  assert.ok(ok("list").includes(kept), "stopping one session must leave other sessions alone");
+  assert.equal(ok("current"), kept);
   console.log("session lifecycle checks passed (stop, history, validation, quit, EOF, signals, both SDK cancellations)");
 } finally {
   for (const child of children) {
